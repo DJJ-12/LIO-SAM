@@ -1,5 +1,6 @@
 #include "utility.hpp"
 #include "lio_sam/msg/cloud_info.hpp"
+#include <functional>
 
 struct smoothness_t{ 
     float value;
@@ -32,10 +33,24 @@ public:
     lio_sam::msg::CloudInfo cloudInfo;
     std_msgs::msg::Header cloudHeader;
 
+    // Offline mode: direct function callback replacing ROS topic publication.
+    std::function<void(const lio_sam::msg::CloudInfo&)> offline_cloud_info_callback_;
+    lio_sam::msg::CloudInfo offline_cloud_info_;
+    bool offline_cloud_info_ready_ = false;
+
     std::vector<smoothness_t> cloudSmoothness;
     float *cloudCurvature;
     int *cloudNeighborPicked;
     int *cloudLabel;
+
+    void SetOfflineCloudInfoCallback(std::function<void(const lio_sam::msg::CloudInfo&)> cb)
+    {
+        offline_cloud_info_callback_ = std::move(cb);
+    }
+
+    bool HasOfflineCloudInfo() const { return offline_cloud_info_ready_; }
+
+    lio_sam::msg::CloudInfo GetOfflineCloudInfo() const { return offline_cloud_info_; }
 
     FeatureExtraction(const rclcpp::NodeOptions & options) :
         ParamServer("lio_sam_featureExtraction", options)
@@ -251,16 +266,24 @@ public:
     void publishFeatureCloud()
     {
         // free cloud info memory
-        freeCloudInfoMemory();
+        
         // save newly extracted features
         cloudInfo.cloud_corner = publishCloud(pubCornerPoints,  cornerCloud,  cloudHeader.stamp, lidarFrame);
         cloudInfo.cloud_surface = publishCloud(pubSurfacePoints, surfaceCloud, cloudHeader.stamp, lidarFrame);
+        // Offline mode: copy/callback before cloudInfo range vectors are cleared.
+        offline_cloud_info_ = cloudInfo;
+        offline_cloud_info_ready_ = true;
+        if (offline_cloud_info_callback_)
+            offline_cloud_info_callback_(offline_cloud_info_);
+
         // publish to mapOptimization
         pubLaserCloudInfo->publish(cloudInfo);
+        freeCloudInfoMemory();
     }
 };
 
 
+#ifndef LIO_SAM_OFFLINE_LIBRARY
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -279,3 +302,4 @@ int main(int argc, char** argv)
     rclcpp::shutdown();
     return 0;
 }
+#endif  // LIO_SAM_OFFLINE_LIBRARY

@@ -1,5 +1,6 @@
 #include "utility.hpp"
 #include "lio_sam/msg/cloud_info.hpp"
+#include <functional>
 
 struct VelodynePointXYZIRT
 {
@@ -29,7 +30,21 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
     (uint32_t, t, t) (uint16_t, reflectivity, reflectivity)
     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
 )
+struct HesaiPointXYZIRT
+{
+    PCL_ADD_POINT4D
+    float intensity;
+    uint16_t ring;
+    double time;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
 
+POINT_CLOUD_REGISTER_POINT_STRUCT(HesaiPointXYZIRT,
+    (float, x, x) (float, y, y) (float, z, z)
+    (float, intensity, intensity)
+    (uint16_t, ring, ring)
+    (double, time, time)
+)
 // Use the Velodyne point format as a common representation
 using PointXYZIRT = VelodynePointXYZIRT;
 
@@ -71,6 +86,7 @@ private:
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    pcl::PointCloud<HesaiPointXYZIRT>::Ptr tmpHesaiCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
@@ -86,12 +102,27 @@ private:
     lio_sam::msg::CloudInfo cloudInfo;
     double timeScanCur;
     double timeScanEnd;
+    double timeScanHeader;
     std_msgs::msg::Header cloudHeader;
 
     vector<int> columnIdnCountVec;
 
+    // Offline mode: direct function callback replacing ROS topic publication.
+    std::function<void(const lio_sam::msg::CloudInfo&)> offline_cloud_info_callback_;
+    lio_sam::msg::CloudInfo offline_cloud_info_;
+    bool offline_cloud_info_ready_ = false;
+
 
 public:
+    void SetOfflineCloudInfoCallback(std::function<void(const lio_sam::msg::CloudInfo&)> cb)
+    {
+        offline_cloud_info_callback_ = std::move(cb);
+    }
+
+    bool HasOfflineCloudInfo() const { return offline_cloud_info_ready_; }
+
+    lio_sam::msg::CloudInfo GetOfflineCloudInfo() const { return offline_cloud_info_; }
+
     ImageProjection(const rclcpp::NodeOptions & options) :
             ParamServer("lio_sam_imageProjection", options), deskewFlag(0)
     {
@@ -137,6 +168,7 @@ public:
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
         tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
+        tmpHesaiCloudIn.reset(new pcl::PointCloud<HesaiPointXYZIRT>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
         extractedCloud.reset(new pcl::PointCloud<PointType>());
 
@@ -232,6 +264,8 @@ public:
         // convert cloud
         currentCloudMsg = std::move(cloudQueue.front());
         cloudQueue.pop_front();
+        cloudHeader = currentCloudMsg.header;
+        timeScanHeader = stamp2Sec(cloudHeader.stamp);
         if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
         {
             pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);  
@@ -254,6 +288,31 @@ public:
                 dst.time = src.t * 1e-9f;
             }
         }
+        else if (sensor == SensorType::HESAI)
+        {
+            pcl::moveFromROSMsg(currentCloudMsg, *tmpHesaiCloudIn);
+
+            laserCloudIn->points.resize(tmpHesaiCloudIn->size());
+            laserCloudIn->is_dense = tmpHesaiCloudIn->is_dense;
+
+            for (size_t i = 0; i < tmpHesaiCloudIn->size(); i++)
+            {
+                auto &src = tmpHesaiCloudIn->points[i];
+                auto &dst = laserCloudIn->points[i];
+
+                dst.x = src.x;
+                dst.y = src.y;
+                dst.z = src.z;
+                dst.intensity = src.intensity;
+                dst.ring = src.ring;
+
+                // Hesai time: absolute timestamp in seconds.
+                // Convert to relative scan time expected by LIO-SAM.
+                double rel_time = src.time - timeScanHeader;
+
+                dst.time = static_cast<float>(rel_time);
+            }
+        }
         else
         {
             RCLCPP_ERROR_STREAM(get_logger(), "Unknown sensor type: " << int(sensor));
@@ -261,9 +320,10 @@ public:
         }
 
         // get timestamp
-        cloudHeader = currentCloudMsg.header;
-        timeScanCur = stamp2Sec(cloudHeader.stamp);
-        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
+        //cloudHeader = currentCloudMsg.header;
+        //timeScanHeader = stamp2Sec(cloudHeader.stamp);
+        timeScanCur = stamp2Sec(cloudHeader.stamp) + laserCloudIn->points.front().time;
+        timeScanEnd =  stamp2Sec(cloudHeader.stamp) + laserCloudIn->points.back().time;
     
         // remove Nan
         vector<int> indices;
@@ -443,7 +503,7 @@ public:
         cloudInfo.initial_guess_pitch = pitch;
         cloudInfo.initial_guess_yaw = yaw;
 
-        cloudInfo.odom_available = true;
+        cloudInfo.odom_available = false;
 
         // get end odometry at the end of the scan
         odomDeskewFlag = false;
@@ -506,7 +566,7 @@ public:
             *rotZCur = imuRotZ[imuPointerFront] * ratioFront + imuRotZ[imuPointerBack] * ratioBack;
         }
     }
-
+    // 默认每帧帧头到帧尾的时间特别短，低速状态下帧尾点相对帧头点 平移为0
     void findPosition(double relTime, float *posXCur, float *posYCur, float *posZCur)
     {
         *posXCur = 0; *posYCur = 0; *posZCur = 0;
@@ -528,7 +588,7 @@ public:
         if (deskewFlag == -1 || cloudInfo.imu_available == false)
             return *point;
 
-        double pointTime = timeScanCur + relTime;
+        double pointTime = timeScanHeader  + relTime;
 
         float rotXCur, rotYCur, rotZCur;
         findRotation(pointTime, &rotXCur, &rotYCur, &rotZCur);
@@ -588,7 +648,7 @@ public:
                 continue;
 
             int columnIdn = -1;
-            if (sensor == SensorType::VELODYNE || sensor == SensorType::OUSTER)
+            if (sensor == SensorType::VELODYNE || sensor == SensorType::OUSTER || sensor == SensorType::HESAI)
             {
                 float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
                 static float ang_res_x = 360.0/float(Horizon_SCAN);
@@ -647,10 +707,18 @@ public:
     {
         cloudInfo.header = cloudHeader;
         cloudInfo.cloud_deskewed  = publishCloud(pubExtractedCloud, extractedCloud, cloudHeader.stamp, lidarFrame);
+
+        // Offline mode: store/callback the message before resetting internal buffers.
+        offline_cloud_info_ = cloudInfo;
+        offline_cloud_info_ready_ = true;
+        if (offline_cloud_info_callback_)
+            offline_cloud_info_callback_(offline_cloud_info_);
+
         pubLaserCloudInfo->publish(cloudInfo);
     }
 };
 
+#ifndef LIO_SAM_OFFLINE_LIBRARY
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -669,3 +737,5 @@ int main(int argc, char** argv)
     rclcpp::shutdown();
     return 0;
 }
+#endif  // LIO_SAM_OFFLINE_LIBRARY
+

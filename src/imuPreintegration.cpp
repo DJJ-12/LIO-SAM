@@ -15,6 +15,7 @@
 
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
+#include <functional>
 
 using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
@@ -33,6 +34,9 @@ public:
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubImuOdometry;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubImuPath;
+
+    // Offline mode: direct function callback replacing ROS topic publication.
+    std::function<void(const nav_msgs::msg::Odometry&)> offline_imu_odometry_callback_;
 
     Eigen::Isometry3d lidarOdomAffine;
     Eigen::Isometry3d imuOdomAffineFront;
@@ -123,7 +127,27 @@ public:
         laserOdometry.pose.pose.position.z = t.transform.translation.z;
         laserOdometry.pose.pose.orientation = t.transform.rotation;
         pubImuOdometry->publish(laserOdometry);
+        
+        if (lidarFrame != baselinkFrame)
+        {
+            tf2::Transform lidar2BaselinkTf;
 
+            // 1) 平移：直接用 extTrans
+            lidar2BaselinkTf.setOrigin(
+                tf2::Vector3(extTrans.x(), extTrans.y(), extTrans.z()));
+
+            // 2) 旋转：用 extRot 构造
+            Eigen::Quaterniond q(extRot);
+            lidar2BaselinkTf.setRotation(
+                tf2::Quaternion(q.x(), q.y(), q.z(), q.w()));
+
+            tf2::Stamped<tf2::Transform> tb(
+                tCur * lidar2BaselinkTf,
+                tf2_ros::fromMsg(odomMsg->header.stamp),
+                odometryFrame);
+            tCur = tb;
+        }
+	/* 0428
         // publish tf
         if(lidarFrame != baselinkFrame)
         {
@@ -140,6 +164,7 @@ public:
                 tCur * lidar2Baselink, tf2_ros::fromMsg(odomMsg->header.stamp), odometryFrame);
             tCur = tb;
         }
+        */
         geometry_msgs::msg::TransformStamped ts;
         tf2::convert(tCur, ts);
         ts.child_frame_id = baselinkFrame;
@@ -173,11 +198,19 @@ class IMUPreintegration : public ParamServer
 {
 public:
 
+    void SetOfflineImuOdometryCallback(std::function<void(const nav_msgs::msg::Odometry&)> cb)
+    {
+        offline_imu_odometry_callback_ = std::move(cb);
+    }
+
     std::mutex mtx;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImu;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subOdometry;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubImuOdometry;
+
+    // Offline mode: direct function callback replacing ROS topic publication.
+    std::function<void(const nav_msgs::msg::Odometry&)> offline_imu_odometry_callback_;
 
     rclcpp::CallbackGroup::SharedPtr callbackGroupImu;
     rclcpp::CallbackGroup::SharedPtr callbackGroupOdom;
@@ -238,8 +271,9 @@ public:
             imuTopic, qos_imu,
             std::bind(&IMUPreintegration::imuHandler, this, std::placeholders::_1),
             imuOpt);
+        // odometry_incremental
         subOdometry = create_subscription<nav_msgs::msg::Odometry>(
-            "lio_sam/mapping/odometry_incremental", qos,
+            "lio_sam/mapping/odometry", qos,    
             std::bind(&IMUPreintegration::odometryHandler, this, std::placeholders::_1),
             odomOpt);
 
@@ -255,7 +289,7 @@ public:
         priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
         priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
         correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
-        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
+        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 5, 5, 5, 5, 5, 5).finished()); // weak LiDAR pose noise for cov=1/2
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
         
         imuIntegratorImu_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for IMU message thread
@@ -300,10 +334,45 @@ public:
         float r_y = odomMsg->pose.pose.orientation.y;
         float r_z = odomMsg->pose.pose.orientation.z;
         float r_w = odomMsg->pose.pose.orientation.w;
-        bool degenerate = (int)odomMsg->pose.covariance[0] == 1 ? true : false;
+        bool degenerate = (int)odomMsg->pose.covariance[0]  >= 1  ? true : false;
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
+        // 0429 新增打印
+        {        // Use stream logging to avoid printf format errors. No graph logic is changed here.
+                    static bool hasLastLidarCorrection = false;
+                    static gtsam::Pose3 lastLidarCorrectionPose;
+                    static double lastLidarCorrectionTime = -1.0;
+                    if (hasLastLidarCorrection)
+                    {
+                    gtsam::Pose3 rel = lastLidarCorrectionPose.between(lidarPose);
+                    double dTrans = rel.translation().norm();
+                    double dYawDeg = std::abs(rel.rotation().rpy()(2)) * 180.0 / M_PI;
+                    double dtCorr = currentCorrectionTime - lastLidarCorrectionTime;
+                    std::ostringstream oss;
+                    oss << "[IMU_PREINT][LIDAR_CORR_IN] status=" << odomMsg->pose.covariance[0]
+                        << " weak=" << (int)degenerate
+                        << " dt=" << dtCorr
+                        << " dTrans=" << dTrans
+                        << " dYawDeg=" << dYawDeg
+                        << " pose=(" << p_x << ", " << p_y << ", " << p_z << ")"
+                        << " optDeltaT=" << imuIntegratorOpt_->deltaTij()
+                        << " queueOpt=" << imuQueOpt.size();
+                    RCLCPP_WARN_STREAM(this->get_logger(), oss.str());
+                }
+                else
+                        {
+                    std::ostringstream oss;
+                    oss << "[IMU_PREINT][LIDAR_CORR_IN] first status=" << odomMsg->pose.covariance[0]
+                        << " weak=" << (int)degenerate
+                        << " pose=(" << p_x << ", " << p_y << ", " << p_z << ")"
+                        << " queueOpt=" << imuQueOpt.size();
+                    RCLCPP_WARN_STREAM(this->get_logger(), oss.str());
+                    }
+                    lastLidarCorrectionPose = lidarPose;
+                    lastLidarCorrectionTime = currentCorrectionTime;
+                    hasLastLidarCorrection = true;
 
+        }
         // 0. initialize system
         if (systemInitialized == false)
         {
@@ -409,6 +478,14 @@ public:
                          gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
         // add pose factor
         gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
+        { // 0429 新增打印
+            std::ostringstream oss;
+            oss << "[IMU_PREINT][POSE_FACTOR] key=" << key
+                << " status=" << odomMsg->pose.covariance[0]
+                << " noise=" << (degenerate ? "correctionNoise2" : "correctionNoise")
+                << " deltaTij=" << imuIntegratorOpt_->deltaTij();
+            RCLCPP_WARN_STREAM(this->get_logger(), oss.str());
+        }
         gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose, degenerate ? correctionNoise2 : correctionNoise);
         graphFactors.add(pose_factor);
         // insert predicted values
@@ -537,10 +614,38 @@ public:
         odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
         odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
         pubImuOdometry->publish(odometry);
+        if (offline_imu_odometry_callback_)
+            offline_imu_odometry_callback_(odometry);
+
+        {// 0429 新增打印
+            // Debug only: continuity of high-rate incremental odometry.
+            static bool hasLastImuOdom = false;
+            static gtsam::Pose3 lastImuOdomPose;
+        static double lastPrintTime = -1.0;
+        if (hasLastImuOdom && (imuTime - lastPrintTime > 0.5))
+            {
+                gtsam::Pose3 rel = lastImuOdomPose.between(lidarPose);
+            std::ostringstream oss;
+            oss << "[IMU_ODOM_CONT] dt=" << dt
+                << " dTrans=" << rel.translation().norm()
+                << " dYawDeg=" << std::abs(rel.rotation().rpy()(2)) * 180.0 / M_PI
+                << " velNorm=" << currentState.velocity().norm()
+                << " pose=(" << lidarPose.translation().x()
+                << ", " << lidarPose.translation().y()
+                << ", " << lidarPose.translation().z() << ")";
+            RCLCPP_WARN_STREAM(this->get_logger(), oss.str());
+            lastPrintTime = imuTime;
+                }
+        if (!hasLastImuOdom)
+            lastPrintTime = imuTime;
+            lastImuOdomPose = lidarPose;
+            hasLastImuOdom = true;
+        }
     }
 };
 
 
+#ifndef LIO_SAM_OFFLINE_LIBRARY
 int main(int argc, char** argv)
 {   
     rclcpp::init(argc, argv);
@@ -554,10 +659,11 @@ int main(int argc, char** argv)
     e.add_node(ImuP);
     e.add_node(TF);
 
-    RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "\033[1;32m----> IMU Preintegration Started.\033[0m");
+    RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "\033[1;32m----> IMU Preintegration Started. cov>=1 uses correctionNoise2, graph structure unchanged.\033[0m");
 
     e.spin();
 
     rclcpp::shutdown();
     return 0;
 }
+#endif  // LIO_SAM_OFFLINE_LIBRARY

@@ -1,113 +1,134 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.8)
 project(lio_sam)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# find dependencies
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
-find_package(tf2_eigen REQUIRED)
-find_package(tf2_ros REQUIRED)
-set(OpenCV_STATIC ON)
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
+
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED)
 find_package(GTSAM REQUIRED)
-find_package(Eigen REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
 
-include_directories(
-  include/lio_sam
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/CloudInfo.msg"
+  "srv/SaveMap.srv"
+  DEPENDENCIES std_msgs sensor_msgs
 )
-
-rosidl_generate_interfaces(${PROJECT_NAME} "msg/CloudInfo.msg" "srv/SaveMap.srv" DEPENDENCIES std_msgs sensor_msgs)
-
-
-
-add_executable(${PROJECT_NAME}_featureExtraction src/featureExtraction.cpp)
-ament_target_dependencies(${PROJECT_NAME}_featureExtraction rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL)
+ament_export_dependencies(rosidl_default_runtime)
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(${PROJECT_NAME}_featureExtraction "${cpp_typesupport_target}") 
 
-add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp)
-ament_target_dependencies(${PROJECT_NAME}_imageProjection rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL)
-target_link_libraries(${PROJECT_NAME}_imageProjection "${cpp_typesupport_target}") 
-
-add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp)
-ament_target_dependencies(${PROJECT_NAME}_imuPreintegration rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL GTSAM Eigen)
-target_link_libraries(${PROJECT_NAME}_imuPreintegration gtsam "${cpp_typesupport_target}")
-
-add_executable(${PROJECT_NAME}_mapOptimization src/mapOptmization.cpp)
-ament_target_dependencies(${PROJECT_NAME}_mapOptimization rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL GTSAM)
-if (OpenMP_CXX_FOUND)
-  target_link_libraries(${PROJECT_NAME}_mapOptimization gtsam "${cpp_typesupport_target}" OpenMP::OpenMP_CXX)
-else()
-  target_link_libraries(${PROJECT_NAME}_mapOptimization gtsam "${cpp_typesupport_target}")
-endif()
-
-
-install(
-  DIRECTORY launch
-  DESTINATION share/${PROJECT_NAME}/
+set(lio_sam_dependencies
+  rclcpp
+  rclpy
+  std_msgs
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_msgs
+  tf2
+  tf2_ros
+  tf2_eigen
+  tf2_geometry_msgs
+  tf2_sensor_msgs
 )
 
-install(
-  DIRECTORY config
-  DESTINATION share/${PROJECT_NAME}/
+set(lio_sam_offline_dependencies
+  ${lio_sam_dependencies}
+  rosbag2_cpp
+  rosbag2_storage
 )
 
-install(
-  TARGETS ${PROJECT_NAME}_imageProjection
+function(configure_lio_sam_target target_name)
+  target_include_directories(${target_name} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PCL_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(${target_name}
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBRARIES}
+    gtsam
+    ${cpp_typesupport_target}
+  )
+
+  if(TARGET gtsam_unstable)
+    target_link_libraries(${target_name} gtsam_unstable)
+  elseif(EXISTS "/usr/lib/x86_64-linux-gnu/libgtsam_unstable.so")
+    target_link_libraries(${target_name} gtsam_unstable)
+  endif()
+
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(${target_name} OpenMP::OpenMP_CXX)
+  endif()
+
+  target_compile_features(${target_name} PUBLIC cxx_std_17)
+endfunction()
+
+function(add_lio_sam_online_node target_name source_file)
+  add_executable(${target_name} ${source_file})
+  ament_target_dependencies(${target_name} ${lio_sam_dependencies})
+  configure_lio_sam_target(${target_name})
+  install(TARGETS ${target_name}
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endfunction()
+
+add_lio_sam_online_node(lio_sam_imageProjection src/imageProjection.cpp)
+add_lio_sam_online_node(lio_sam_featureExtraction src/featureExtraction.cpp)
+add_lio_sam_online_node(lio_sam_imuPreintegration src/imuPreintegration.cpp)
+add_lio_sam_online_node(lio_sam_mapOptimization src/mapOptmization.cpp)
+
+add_executable(lio_sam_run_offline
+  src/run_lio_sam_offline.cpp
+  src/offline/bag_io.cpp
+)
+ament_target_dependencies(lio_sam_run_offline ${lio_sam_offline_dependencies})
+configure_lio_sam_target(lio_sam_run_offline)
+target_compile_definitions(lio_sam_run_offline PRIVATE LIO_SAM_OFFLINE_LIBRARY)
+install(TARGETS lio_sam_run_offline
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(
-  TARGETS ${PROJECT_NAME}_imuPreintegration
-  DESTINATION lib/${PROJECT_NAME}
+install(DIRECTORY launch config
+  DESTINATION share/${PROJECT_NAME}
 )
 
-install(
-  TARGETS ${PROJECT_NAME}_featureExtraction
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS ${PROJECT_NAME}_mapOptimization
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  DIRECTORY "include/"
+install(DIRECTORY include/
   DESTINATION include
 )
 
-ament_export_include_directories(include)
-
-if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  #set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  #set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
-endif()
-
 ament_package()
-

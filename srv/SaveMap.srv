@@ -1,4 +1,4 @@
-float32 resolution
 string destination
+float32 resolution
 ---
 bool success

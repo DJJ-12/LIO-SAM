@@ -15,6 +15,14 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+#include <pcl/registration/icp.h>
+#include <pcl/registration/ndt.h>
+#include <pcl/filters/filter.h>
+#include <limits>
+#include <cmath>
+#include <algorithm>
+#include <filesystem>
+#include <functional>
 
 using namespace gtsam;
 
@@ -82,6 +90,7 @@ public:
 
     vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames;
     vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;
+    vector<pcl::PointCloud<PointType>::Ptr> rawCloudKeyFrames;
     
     pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;
     pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
@@ -92,6 +101,10 @@ public:
     pcl::PointCloud<PointType>::Ptr laserCloudSurfLast; // surf feature set from odoOptimization
     pcl::PointCloud<PointType>::Ptr laserCloudCornerLastDS; // downsampled corner feature set from odoOptimization
     pcl::PointCloud<PointType>::Ptr laserCloudSurfLastDS; // downsampled surf feature set from odoOptimization
+
+    // Current raw deskewed scan for ICP fallback
+    pcl::PointCloud<PointType>::Ptr laserCloudRawLast;
+
 
     pcl::PointCloud<PointType>::Ptr laserCloudOri;
     pcl::PointCloud<PointType>::Ptr coeffSel;
@@ -109,6 +122,10 @@ public:
     pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMapDS;
     pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMapDS;
 
+    // Local raw submap for ICP fallback
+    pcl::PointCloud<PointType>::Ptr laserCloudRawFromMap;
+    pcl::PointCloud<PointType>::Ptr laserCloudRawFromMapDS;
+
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerFromMap;
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurfFromMap;
 
@@ -118,13 +135,42 @@ public:
     pcl::VoxelGrid<PointType> downSizeFilterCorner;
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
     pcl::VoxelGrid<PointType> downSizeFilterICP;
+    pcl::VoxelGrid<PointType> downSizeFilterRawICP;
     pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
     rclcpp::Time timeLaserInfoStamp;
     double timeLaserInfoCur;
 
     float transformTobeMapped[6];
+    // 0429新增
+    // Current LiDAR observation quality code published in pose.covariance[0]:
+    //   0 = normal/high-confidence pose, can enter keyframe map;
+    //   1 = weak pose, publish to IMU with larger noise, do NOT enter keyframe map;
+    //   2 = very weak pose, publish to IMU with much lower confidence, do NOT enter keyframe map.
+    int currentOdomCov;
 
+    // Offline mode: direct function callbacks replacing ROS topic publication.
+    std::function<void(const nav_msgs::msg::Odometry&)> offline_odometry_callback_;
+    std::function<void(const nav_msgs::msg::Odometry&)> offline_incremental_odometry_callback_;
+
+    // Published-pose motion history.
+    // Updated for every published LiDAR odometry, not only keyframes.
+    // Used to detect LM false convergence by adjacent local motion continuity:
+    // compare current v / yaw-rate / curvature with the immediately previous few samples,
+    // then judge whether acceleration / angular acceleration / curvature jump is abnormal.
+    bool hasLastOutputPose;
+    Eigen::Affine3f lastOutputAffine;
+    double lastOutputTime;
+    std::deque<double> speedHist;       // m/s, one sample for every published odometry frame
+    std::deque<double> yawRateHist;     // deg/s, one sample for every published odometry frame
+    std::deque<double> curvatureHist;   // 1/m, one sample for every published odometry frame
+    const int motionHistoryWindow = 8;
+
+    const double debugRollPitchWarnDeg = 2.0;
+
+    const float maxRawIcpSourceRange = 80.0f;  // current raw source only removes invalid points and points beyond 80 m
+    const float maxRawIcpTargetRadius = 80.0f;
+    // 0429 end
     std::mutex mtx;
     std::mutex mtxLoopInfo;
 
@@ -151,8 +197,87 @@ public:
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> br;
 
+    void SetOfflineOdometryCallback(std::function<void(const nav_msgs::msg::Odometry&)> cb)
+    {
+        offline_odometry_callback_ = std::move(cb);
+    }
+
+    void SetOfflineIncrementalOdometryCallback(std::function<void(const nav_msgs::msg::Odometry&)> cb)
+    {
+        offline_incremental_odometry_callback_ = std::move(cb);
+    }
+
+    size_t GetOfflineKeyframeCount() const
+    {
+        return cloudKeyPoses6D ? cloudKeyPoses6D->size() : 0;
+    }
+
+    void RunOfflineLoopClosureOnce()
+    {
+        if (!loopClosureEnableFlag)
+            return;
+        performLoopClosure();
+        visualizeLoopClosure();
+    }
+
+    bool SaveMapOffline(const std::string& directory, float resolution = 0.0f)
+    {
+        std::string saveMapDirectory = directory;
+        if (saveMapDirectory.empty())
+            saveMapDirectory = std::string(std::getenv("HOME")) + savePCDDirectory;
+
+        if (cloudKeyPoses3D->empty() || cloudKeyPoses6D->empty()) {
+            RCLCPP_WARN(get_logger(), "[OFFLINE_SAVE] no keyframes, skip map saving");
+            return false;
+        }
+
+        std::filesystem::remove_all(saveMapDirectory);
+        std::filesystem::create_directories(saveMapDirectory);
+
+        pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
+        pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
+
+        pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
+
+        for (int i = 0; i < (int)cloudKeyPoses6D->size(); i++) {
+            *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
+            *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],   &cloudKeyPoses6D->points[i]);
+        }
+
+        if (resolution > 0.0f) {
+            downSizeFilterCorner.setInputCloud(globalCornerCloud);
+            downSizeFilterCorner.setLeafSize(resolution, resolution, resolution);
+            downSizeFilterCorner.filter(*globalCornerCloudDS);
+            pcl::io::savePCDFileBinary(saveMapDirectory + "/CornerMap.pcd", *globalCornerCloudDS);
+
+            downSizeFilterSurf.setInputCloud(globalSurfCloud);
+            downSizeFilterSurf.setLeafSize(resolution, resolution, resolution);
+            downSizeFilterSurf.filter(*globalSurfCloudDS);
+            pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloudDS);
+
+            *globalMapCloud += *globalCornerCloudDS;
+            *globalMapCloud += *globalSurfCloudDS;
+        } else {
+            pcl::io::savePCDFileBinary(saveMapDirectory + "/CornerMap.pcd", *globalCornerCloud);
+            pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloud);
+            *globalMapCloud += *globalCornerCloud;
+            *globalMapCloud += *globalSurfCloud;
+        }
+
+        int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
+        downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
+        downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        RCLCPP_INFO(get_logger(), "[OFFLINE_SAVE] saved map to %s", saveMapDirectory.c_str());
+        return ret == 0;
+    }
+
     mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("lio_sam_mapOptimization", options)
     {
+        cout << "build version, 2026-0429-ndt-trajectory-curvature-no-reject ... " << endl;
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
@@ -247,7 +372,16 @@ public:
         downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        // Raw ICP fallback uses voxel filtering only for ICP computation, not for raw-keyframe storage.
+        // 0.10 m keeps more raw geometry than 0.20 m while still preventing excessive runtime.
+        downSizeFilterRawICP.setLeafSize(0.30f, 0.30f, 0.30f);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
+
+        // 0429新增成员变量初始化
+        currentOdomCov = 0;
+        hasLastOutputPose = false;
+        lastOutputAffine = Eigen::Affine3f::Identity();
+        lastOutputTime = -1.0;
 
         allocateMemory();
     }
@@ -266,6 +400,8 @@ public:
         laserCloudSurfLast.reset(new pcl::PointCloud<PointType>()); // surf feature set from odoOptimization
         laserCloudCornerLastDS.reset(new pcl::PointCloud<PointType>()); // downsampled corner featuer set from odoOptimization
         laserCloudSurfLastDS.reset(new pcl::PointCloud<PointType>()); // downsampled surf featuer set from odoOptimization
+        laserCloudRawLast.reset(new pcl::PointCloud<PointType>());
+
 
         laserCloudOri.reset(new pcl::PointCloud<PointType>());
         coeffSel.reset(new pcl::PointCloud<PointType>());
@@ -284,6 +420,8 @@ public:
         laserCloudSurfFromMap.reset(new pcl::PointCloud<PointType>());
         laserCloudCornerFromMapDS.reset(new pcl::PointCloud<PointType>());
         laserCloudSurfFromMapDS.reset(new pcl::PointCloud<PointType>());
+        laserCloudRawFromMap.reset(new pcl::PointCloud<PointType>());
+        laserCloudRawFromMapDS.reset(new pcl::PointCloud<PointType>());
 
         kdtreeCornerFromMap.reset(new pcl::KdTreeFLANN<PointType>());
         kdtreeSurfFromMap.reset(new pcl::KdTreeFLANN<PointType>());
@@ -314,6 +452,7 @@ public:
             timeLastProcessing = timeLaserInfoCur;
 
             updateInitialGuess();
+            currentOdomCov = 0;
 
             extractSurroundingKeyFrames();
 
@@ -793,14 +932,30 @@ public:
         // initialization
         if (cloudKeyPoses3D->points.empty())
         {
-            transformTobeMapped[0] = cloudInfo.imu_roll_init;
-            transformTobeMapped[1] = cloudInfo.imu_pitch_init;
-            transformTobeMapped[2] = cloudInfo.imu_yaw_init;
+            //transformTobeMapped[0] = cloudInfo.imu_roll_init;
+            //transformTobeMapped[1] = cloudInfo.imu_pitch_init;
+            //transformTobeMapped[2] = cloudInfo.imu_yaw_init;
+            transformTobeMapped[0] = 0.0;  // roll
+            transformTobeMapped[1] = 0.0;  // pitch
+            transformTobeMapped[2] = 0.0;  // yaw
 
             if (!useImuHeadingInitialization)
                 transformTobeMapped[2] = 0;
 
             lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imu_roll_init, cloudInfo.imu_pitch_init, cloudInfo.imu_yaw_init); // save imu before return;
+            
+            {     //0429
+                if (std::abs(pcl::rad2deg(transformTobeMapped[0])) > debugRollPitchWarnDeg ||
+                std::abs(pcl::rad2deg(transformTobeMapped[1])) > debugRollPitchWarnDeg)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RP-THRESH][updateInitialGuess-init] roll=%.3f pitch=%.3f thresh=%.3f deg",
+                        pcl::rad2deg(transformTobeMapped[0]),
+                        pcl::rad2deg(transformTobeMapped[1]),
+                        debugRollPitchWarnDeg);
+                }
+            
+            }
             return;
         }
 
@@ -826,6 +981,19 @@ public:
                 lastImuPreTransformation = transBack;
 
                 lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imu_roll_init, cloudInfo.imu_pitch_init, cloudInfo.imu_yaw_init); // save imu before return;
+                
+                if (std::abs(pcl::rad2deg(transformTobeMapped[0])) > debugRollPitchWarnDeg ||
+                    std::abs(pcl::rad2deg(transformTobeMapped[1])) > debugRollPitchWarnDeg)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RP-THRESH][updateInitialGuess-odom] roll=%.3f pitch=%.3f guess_rp=(%.3f, %.3f) thresh=%.3f deg",
+                        pcl::rad2deg(transformTobeMapped[0]),
+                        pcl::rad2deg(transformTobeMapped[1]),
+                        pcl::rad2deg(cloudInfo.initial_guess_roll),
+                        pcl::rad2deg(cloudInfo.initial_guess_pitch),
+                        debugRollPitchWarnDeg);
+                }
+               
                 return;
             }
         }
@@ -929,10 +1097,25 @@ public:
         downSizeFilterCorner.setInputCloud(laserCloudCornerFromMap);
         downSizeFilterCorner.filter(*laserCloudCornerFromMapDS);
         laserCloudCornerFromMapDSNum = laserCloudCornerFromMapDS->size();
+        // 0428 新增
+        if(laserCloudCornerFromMapDSNum < 500)
+        {
+            pcl::copyPointCloud(*laserCloudCornerFromMap, *laserCloudCornerFromMapDS);
+            laserCloudCornerFromMapDSNum = laserCloudCornerFromMapDS->size();
+        }
+        //  0428 end
         // Downsample the surrounding surf key frames (or map)
         downSizeFilterSurf.setInputCloud(laserCloudSurfFromMap);
         downSizeFilterSurf.filter(*laserCloudSurfFromMapDS);
         laserCloudSurfFromMapDSNum = laserCloudSurfFromMapDS->size();
+        //0428 
+        if(laserCloudSurfFromMapDSNum < 500)
+        {
+            pcl::copyPointCloud(*laserCloudSurfFromMap, *laserCloudSurfFromMapDS);
+            laserCloudSurfFromMapDSNum = laserCloudSurfFromMapDS->size();
+
+        }
+        //0428 end
 
         // clear map cache if too large
         if (laserCloudMapContainer.size() > 1000)
@@ -961,11 +1144,22 @@ public:
         downSizeFilterCorner.setInputCloud(laserCloudCornerLast);
         downSizeFilterCorner.filter(*laserCloudCornerLastDS);
         laserCloudCornerLastDSNum = laserCloudCornerLastDS->size();
+        if(laserCloudCornerLastDSNum < 500)
+        {
+            pcl::copyPointCloud(*laserCloudCornerLast, *laserCloudCornerLastDS);
+            laserCloudCornerLastDSNum = laserCloudCornerLastDS->size();
+        }
+
 
         laserCloudSurfLastDS->clear();
         downSizeFilterSurf.setInputCloud(laserCloudSurfLast);
         downSizeFilterSurf.filter(*laserCloudSurfLastDS);
         laserCloudSurfLastDSNum = laserCloudSurfLastDS->size();
+        if(laserCloudSurfLastDSNum < 500)
+        {
+            pcl::copyPointCloud(*laserCloudSurfLast, *laserCloudSurfLastDS);
+            laserCloudSurfLastDSNum = laserCloudSurfLastDS->size();
+        }
     }
 
     void updatePointAssociateToMap()
@@ -1282,13 +1476,395 @@ public:
         return false; // keep optimizing
     }
 
+
+    double normalizeAngleRad(double angle)
+    {
+        while (angle > M_PI)  angle -= 2.0 * M_PI;
+        while (angle < -M_PI) angle += 2.0 * M_PI;
+        return angle;
+    }
+
+    void setTransformFromAffine(const Eigen::Affine3f& affine)
+    {
+        float x, y, z, roll, pitch, yaw;
+        pcl::getTranslationAndEulerAngles(affine, x, y, z, roll, pitch, yaw);
+        transformTobeMapped[0] = roll;
+        transformTobeMapped[1] = pitch;
+        transformTobeMapped[2] = yaw;
+        transformTobeMapped[3] = x;
+        transformTobeMapped[4] = y;
+        transformTobeMapped[5] = z;
+    }
+
+    bool isFinitePoint(const PointType& p) const
+    {
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+    }
+
+    void filterInvalidAndRangeInPlace(pcl::PointCloud<PointType>::Ptr& cloud, const char* tag, bool alsoLimitSourceRange = false)
+    {
+        if (!cloud || cloud->empty()) return;
+        pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
+        filtered->reserve(cloud->size());
+        const float maxRange2 = maxRawIcpSourceRange * maxRawIcpSourceRange;
+        for (const auto& p : cloud->points)
+        {
+            if (!isFinitePoint(p)) continue;
+            if (alsoLimitSourceRange)
+            {
+                const float r2 = p.x*p.x + p.y*p.y + p.z*p.z;
+                if (r2 > maxRange2) continue;
+            }
+            filtered->push_back(p);
+        }
+        filtered->width = filtered->size();
+        filtered->height = 1;
+        filtered->is_dense = true;
+        cloud.swap(filtered);
+    }
+
+    void cropMapCloudAroundPriorInPlace(pcl::PointCloud<PointType>::Ptr& cloud, const Eigen::Vector3f& center)
+    {
+        if (!cloud || cloud->empty()) return;
+        pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
+        filtered->reserve(cloud->size());
+        const float r2max = maxRawIcpTargetRadius * maxRawIcpTargetRadius;
+        for (const auto& p : cloud->points)
+        {
+            if (!isFinitePoint(p)) continue;
+            const float dx = p.x - center.x();
+            const float dy = p.y - center.y();
+            const float dz = p.z - center.z();
+            if (dx*dx + dy*dy + dz*dz <= r2max) filtered->push_back(p);
+        }
+        filtered->width = filtered->size();
+        filtered->height = 1;
+        filtered->is_dense = true;
+        cloud.swap(filtered);
+    }
+
+    bool poseCloseToPrior(const Eigen::Affine3f& priorAffine,
+                          const Eigen::Affine3f& candidateAffine,
+                          const double maxTrans,
+                          const double maxYawDeg,
+                          const double maxZ,
+                          const char* tag)
+    {
+        Eigen::Affine3f rel = priorAffine.inverse() * candidateAffine;
+        float dx, dy, dz, droll, dpitch, dyaw;
+        pcl::getTranslationAndEulerAngles(rel, dx, dy, dz, droll, dpitch, dyaw);
+
+        const double dTrans = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double dYawDeg = std::abs(pcl::rad2deg(normalizeAngleRad(dyaw)));
+        const double dZ = std::abs(dz);
+
+        float cx, cy, cz, cr, cp, cyaw;
+        pcl::getTranslationAndEulerAngles(candidateAffine, cx, cy, cz, cr, cp, cyaw);
+        const double rollAbsDeg = std::abs(pcl::rad2deg(cr));
+        const double pitchAbsDeg = std::abs(pcl::rad2deg(cp));
+
+        const bool ok = (dTrans <= maxTrans && dYawDeg <= maxYawDeg && dZ <= maxZ &&
+                         rollAbsDeg < debugRollPitchWarnDeg && pitchAbsDeg < debugRollPitchWarnDeg);
+        if (!ok)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[BAD FRAME][%s] candidate is not consistent with current prior. "
+                "dTrans=%.3f/%.3f dYaw=%.2f/%.2fdeg dZ=%.3f/%.3f "
+                "candidate xyz/rpy=(%.3f %.3f %.3f | %.2f %.2f %.2f deg)",
+                tag, dTrans, maxTrans, dYawDeg, maxYawDeg, dZ, maxZ,
+                cx, cy, cz, pcl::rad2deg(cr), pcl::rad2deg(cp), pcl::rad2deg(cyaw));
+        }
+        return ok;
+    }
+
+    struct MotionContinuityInfo
+    {
+        bool ready = false;
+        bool continuous = true;
+        double dt = 0.0;
+        double ds = 0.0;
+        double dyawDeg = 0.0;
+        double speed = 0.0;       // m/s
+        double yawRate = 0.0;     // deg/s
+        double accel = 0.0;       // m/s^2, relative to adjacent recent speed
+        double yawAccel = 0.0;    // deg/s^2, relative to adjacent recent yaw-rate
+        double curvature = 0.0;   // 1/m, approx |dyaw| / max(ds, eps)
+        double speedRef = 0.0;
+        double yawRateRef = 0.0;
+        double curvatureRef = 0.0;
+        double speedJump = 0.0;
+        double yawRateJump = 0.0;
+        double curvatureJump = 0.0;
+    };
+
+    double yawFromAffine(const Eigen::Affine3f& a)
+    {
+        float x, y, z, r, p, yaw;
+        pcl::getTranslationAndEulerAngles(a, x, y, z, r, p, yaw);
+        return yaw;
+    }
+
+    double xyDistance(const Eigen::Affine3f& a, const Eigen::Affine3f& b)
+    {
+        float ax, ay, az, ar, ap, ayaw;
+        float bx, by, bz, br, bp, byaw;
+        pcl::getTranslationAndEulerAngles(a, ax, ay, az, ar, ap, ayaw);
+        pcl::getTranslationAndEulerAngles(b, bx, by, bz, br, bp, byaw);
+        const double dx = ax - bx;
+        const double dy = ay - by;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    MotionContinuityInfo evaluateMotionContinuity(const Eigen::Affine3f& candidateAffine, const char* tag)
+    {
+        MotionContinuityInfo info;
+
+        if (!hasLastOutputPose)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[MOTION_GATE][%s] no last published pose; treat as continuous.", tag);
+            return info;
+        }
+
+        info.dt = (lastOutputTime > 0.0) ? std::max(1e-3, timeLaserInfoCur - lastOutputTime) : 0.0;
+        info.ds = xyDistance(lastOutputAffine, candidateAffine);
+        info.dyawDeg = std::abs(pcl::rad2deg(normalizeAngleRad(yawFromAffine(candidateAffine) - yawFromAffine(lastOutputAffine))));
+        info.speed = info.ds / std::max(1e-3, info.dt);
+        info.yawRate = info.dyawDeg / std::max(1e-3, info.dt);
+
+        // Low-speed 10 Hz vehicle: single-frame ds can be very small, so use a floor.
+        // This makes curvature a smooth geometric indicator, not a division-by-noise detector.
+        const double curvatureDs = std::max(info.ds, 0.10);
+        info.curvature = (info.dyawDeg * M_PI / 180.0) / curvatureDs;
+
+        // Warm-up: before one previous published motion sample exists, do not reject.
+        // The previous sample is computed from the previous published pose to the current last published pose.
+        // This is NOT based on keyframes; it uses every published LiDAR odometry frame.
+        if (speedHist.empty() || yawRateHist.empty() || curvatureHist.empty())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[MOTION_GATE][%s] warmup hist=%zu dt=%.3f ds=%.3f dyaw=%.2fdeg v=%.3f omega=%.2f kappa=%.3f; continuous.",
+                tag, speedHist.size(), info.dt, info.ds, info.dyawDeg, info.speed, info.yawRate, info.curvature);
+            return info;
+        }
+
+        info.ready = true;
+
+        // Adjacent-frame continuity:
+        //   acceleration        = |v_k     - v_{k-1}|     / dt_k
+        //   angular acceleration= |omega_k - omega_{k-1}| / dt_k
+        //   curvature jump      = |kappa_k - kappa_{k-1}|
+        // Here k-1 is the immediately previous published odometry interval, not a keyframe interval.
+        // This matches the physical meaning of a jump: a sudden change relative to the adjacent trajectory segment.
+        info.speedRef = speedHist.back();
+        info.yawRateRef = yawRateHist.back();
+        info.curvatureRef = curvatureHist.back();
+
+        info.speedJump = std::abs(info.speed - info.speedRef);
+        info.yawRateJump = std::abs(info.yawRate - info.yawRateRef);
+        info.curvatureJump = std::abs(info.curvature - info.curvatureRef);
+        info.accel = info.speedJump / std::max(1e-3, info.dt);
+        info.yawAccel = info.yawRateJump / std::max(1e-3, info.dt);
+
+        // Physical continuity gates for a <0.5 m/s ground vehicle.
+        // These are intentionally permissive: they should catch sudden LM false convergence, not normal slow turning.
+        // Since dt may be affected by mappingProcessInterval/CPU, require both a derivative jump and an absolute jump.
+        const bool speedBad = (info.speed > 1.50);
+        const bool accelBad = (info.accel > 1.20 && info.speedJump > 0.30);
+        const bool yawRateBad = (info.yawRate > 80.0);
+        const bool yawAccelBad = (info.yawAccel > 180.0 && info.yawRateJump > 18.0);
+        const bool curvatureBad = (info.curvatureJump > 1.80 && info.dyawDeg > 1.0 && info.ds > 0.03);
+
+        info.continuous = !(speedBad || accelBad || yawRateBad || yawAccelBad || curvatureBad);
+
+        RCLCPP_WARN(this->get_logger(),
+            "[MOTION_GATE][%s] ok=%d dt=%.3f ds=%.3f dyaw=%.2fdeg "
+            "v=%.3f(prev=%.3f,dv=%.3f,a=%.3f) "
+            "omega=%.2f(prev=%.2f,d=%.2f,alpha=%.2f) "
+            "kappa=%.3f(prev=%.3f,d=%.3f) bad(speed=%d accel=%d omega=%d alpha=%d kappa=%d)",
+            tag, (int)info.continuous, info.dt, info.ds, info.dyawDeg,
+            info.speed, info.speedRef, info.speedJump, info.accel,
+            info.yawRate, info.yawRateRef, info.yawRateJump, info.yawAccel,
+            info.curvature, info.curvatureRef, info.curvatureJump,
+            (int)speedBad, (int)accelBad, (int)yawRateBad, (int)yawAccelBad, (int)curvatureBad);
+
+        return info;
+    }
+
+    void pushMotionHistory(double v, double omegaDeg, double kappa)
+    {
+        speedHist.push_back(v); // 速度
+        yawRateHist.push_back(omegaDeg); // 角速度
+        curvatureHist.push_back(kappa); // 曲率
+        while ((int)speedHist.size() > motionHistoryWindow) speedHist.pop_front();
+        while ((int)yawRateHist.size() > motionHistoryWindow) yawRateHist.pop_front();
+        while ((int)curvatureHist.size() > motionHistoryWindow) curvatureHist.pop_front();
+    }
+
+    void updateOutputTrajectoryHistory(const Eigen::Affine3f& outputAffine)
+    {
+        if (hasLastOutputPose)
+        {
+            const double dt = std::max(1e-3, timeLaserInfoCur - lastOutputTime);
+            const double ds = xyDistance(lastOutputAffine, outputAffine);
+            const double dyawDeg = std::abs(pcl::rad2deg(normalizeAngleRad(yawFromAffine(outputAffine) - yawFromAffine(lastOutputAffine))));
+            const double v = ds / dt;
+            const double omega = dyawDeg / dt;
+            const double kappa = (dyawDeg * M_PI / 180.0) / std::max(ds, 0.10);
+            pushMotionHistory(v, omega, kappa);
+        }
+
+        lastOutputAffine = outputAffine;
+        lastOutputTime = timeLaserInfoCur;
+        hasLastOutputPose = true;
+    }
+
+    bool prepareCurrentRawCloudForRegistration()
+    {
+        laserCloudRawLast->clear();
+        pcl::fromROSMsg(cloudInfo.cloud_deskewed, *laserCloudRawLast);
+        if (laserCloudRawLast->empty())
+            return false;
+
+        // Current frame source: keep full valid resolution. Only remove NaN/Inf and >80m points.
+        filterInvalidAndRangeInPlace(laserCloudRawLast, "raw_current_registration", true);
+        return laserCloudRawLast->size() >= 300;
+    }
+
+    bool buildRawLocalMapForRegistration()
+    {
+        laserCloudRawFromMap->clear();
+        laserCloudRawFromMapDS->clear();
+
+        if (cloudKeyPoses3D->empty() || rawCloudKeyFrames.empty())
+            return false;
+
+        std::vector<int> pointSearchInd;
+        std::vector<float> pointSearchSqDis;
+
+        PointType searchPoint;
+        searchPoint.x = transformTobeMapped[3];
+        searchPoint.y = transformTobeMapped[4];
+        searchPoint.z = transformTobeMapped[5];
+
+        kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D);
+        kdtreeSurroundingKeyPoses->radiusSearch(searchPoint, surroundingKeyframeSearchRadius,
+                                                pointSearchInd, pointSearchSqDis, 0);
+
+        const int maxRawKeyframes = 20;
+        if (pointSearchInd.empty())
+        {
+            const int cloudSize = cloudKeyPoses3D->size();
+            const int historyNum = std::min(maxRawKeyframes, cloudSize);
+            for (int i = cloudSize - historyNum; i < cloudSize; ++i)
+                pointSearchInd.push_back(i);
+        }
+        else if ((int)pointSearchInd.size() > maxRawKeyframes)
+        {
+            pointSearchInd.resize(maxRawKeyframes);
+        }
+
+        Eigen::Vector3f priorCenter(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]);
+        for (const int idx : pointSearchInd)
+        {
+            if (idx < 0 || idx >= (int)rawCloudKeyFrames.size())
+                continue;
+            if (rawCloudKeyFrames[idx]->empty())
+                continue;
+
+            pcl::PointCloud<PointType>::Ptr transformed = transformPointCloud(rawCloudKeyFrames[idx], &cloudKeyPoses6D->points[idx]);
+            cropMapCloudAroundPriorInPlace(transformed, priorCenter);
+            if (!transformed->empty())
+                *laserCloudRawFromMap += *transformed;
+        }
+
+        if (laserCloudRawFromMap->size() < 800)
+            return false;
+
+        // Only the submap target is downsampled. The current source scan is not voxel-filtered.
+        downSizeFilterRawICP.setInputCloud(laserCloudRawFromMap);
+        downSizeFilterRawICP.filter(*laserCloudRawFromMapDS);
+        return laserCloudRawFromMapDS->size() >= 500;
+    }
+
+    bool rawCloudICPFallback(const Eigen::Affine3f& initialGuess,
+                             Eigen::Affine3f& resultAffine,
+                             double& fitnessScore)
+    {
+        if (!prepareCurrentRawCloudForRegistration())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][FAIL] current raw deskewed cloud is too small after invalid/range filtering: raw=%zu",
+                laserCloudRawLast->size());
+            return false;
+        }
+
+        setTransformFromAffine(initialGuess);
+        if (!buildRawLocalMapForRegistration())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][FAIL] raw local map is too small: rawMap=%zu rawMapDS=%zu rawKeyFrames=%zu",
+                laserCloudRawFromMap->size(), laserCloudRawFromMapDS->size(), rawCloudKeyFrames.size());
+            return false;
+        }
+
+        pcl::IterativeClosestPoint<PointType, PointType> icp;
+        icp.setInputSource(laserCloudRawLast);        // full current scan, not downsampled
+        icp.setInputTarget(laserCloudRawFromMapDS);   // downsampled local raw submap
+        icp.setMaxCorrespondenceDistance(1.0);
+        icp.setMaximumIterations(35);
+        icp.setTransformationEpsilon(1e-6);
+        icp.setEuclideanFitnessEpsilon(1e-4);
+        icp.setRANSACIterations(0);
+
+        pcl::PointCloud<PointType>::Ptr aligned(new pcl::PointCloud<PointType>());
+        icp.align(*aligned, initialGuess.matrix());
+
+        fitnessScore = icp.hasConverged() ? icp.getFitnessScore(2.0) : std::numeric_limits<double>::infinity();
+        if (!icp.hasConverged())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][FAIL] did not converge. source=%zu target=%zu",
+                laserCloudRawLast->size(), laserCloudRawFromMapDS->size());
+            return false;
+        }
+
+        resultAffine = Eigen::Affine3f(icp.getFinalTransformation());
+
+        const double maxIcpFitness = 0.35;
+        if (fitnessScore > maxIcpFitness)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][FAIL] fitness %.6f > %.6f. source=%zu target=%zu",
+                fitnessScore, maxIcpFitness, laserCloudRawLast->size(), laserCloudRawFromMapDS->size());
+            return false;
+        }
+
+        RCLCPP_WARN(this->get_logger(),
+            "[ICP][CANDIDATE] fitness=%.6f source=%zu target=%zu",
+            fitnessScore, laserCloudRawLast->size(), laserCloudRawFromMapDS->size());
+        return true;
+    }
+
     void scan2MapOptimization()
     {
         if (cloudKeyPoses3D->points.empty())
             return;
 
-        if (laserCloudCornerLastDSNum > edgeFeatureMinValidNum && laserCloudSurfLastDSNum > surfFeatureMinValidNum)
+        currentOdomCov = 0;
+        isDegenerate = false;
+
+        Eigen::Affine3f priorAffine = trans2Affine3f(transformTobeMapped);
+        bool lmRan = false;
+        bool lmMotionOk = false;
+        bool lmConverged = false;
+        int finalCoeffNum = 0;
+        Eigen::Affine3f lmAffine = priorAffine;
+
+        if (laserCloudCornerLastDSNum > edgeFeatureMinValidNum &&
+            laserCloudSurfLastDSNum   > surfFeatureMinValidNum)
         {
+            lmRan = true;
             kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMapDS);
             kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMapDS);
 
@@ -1299,16 +1875,85 @@ public:
 
                 cornerOptimization();
                 surfOptimization();
-
                 combineOptimizationCoeffs();
 
-                if (LMOptimization(iterCount) == true)
-                    break;              
+                finalCoeffNum = (int)laserCloudOri->size();
+                lmConverged = LMOptimization(iterCount);
+
+                if (lmConverged)
+                    break;
             }
 
             transformUpdate();
-        } else {
-            RCLCPP_WARN(get_logger(), "Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
+            lmAffine = trans2Affine3f(transformTobeMapped);
+            MotionContinuityInfo lmMotion = evaluateMotionContinuity(lmAffine, "LM");
+            lmMotionOk = lmMotion.continuous;
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "[LM][FEATURE_WEAK] cornerDS=%d/%d surfDS=%d/%d. Try raw ICP fallback.",
+                laserCloudCornerLastDSNum, edgeFeatureMinValidNum,
+                laserCloudSurfLastDSNum, surfFeatureMinValidNum);
+        }
+        
+        if (lmConverged && !isDegenerate && finalCoeffNum >= 80 && lmMotionOk)
+        {
+            currentOdomCov = 0;
+            RCLCPP_WARN(this->get_logger(),
+                "[LM][USE_HIGH] converged=%d degenerate=%d coeff=%d motionOK=%d cov=0 save=yes",
+                (int)lmConverged, (int)isDegenerate, finalCoeffNum, (int)lmMotionOk);
+            return;
+        }
+        // LM 优化失败
+        RCLCPP_WARN(this->get_logger(),
+            "[LM][SUSPECT] ran=%d converged=%d degenerate=%d coeff=%d motionOK=%d. Try raw ICP fallback.",
+            (int)lmRan, (int)lmConverged, (int)isDegenerate, finalCoeffNum, (int)lmMotionOk);
+
+        setTransformFromAffine(priorAffine);
+        Eigen::Affine3f icpAffine = priorAffine;
+        double icpFitness = std::numeric_limits<double>::infinity();
+        if (rawCloudICPFallback(priorAffine, icpAffine, icpFitness))
+        {
+            MotionContinuityInfo icpMotion = evaluateMotionContinuity(icpAffine, "ICP");
+            const bool icpHigh = icpMotion.continuous && icpFitness < 0.3;
+            if (icpHigh){
+                setTransformFromAffine(icpAffine);
+                transformUpdate();
+                currentOdomCov = 0;
+                isDegenerate = false;
+
+                RCLCPP_WARN(this->get_logger(),
+                    "[ICP][USE_HIGH] fitness=%.6f motionOK=%d cov=0 save=yes",
+                    icpFitness, (int)icpMotion.continuous);
+                return;
+            }
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][REJECT_WEAK] fitness=%.6f motionOK=%d. Continue fallback.",
+                icpFitness, (int)icpMotion.continuous);
+        }else{
+            RCLCPP_WARN(this->get_logger(),
+                "[ICP][FAILED] Continue fallback.");
+        }
+        // icp 也失败 ， 就使用LM 优化结果 ，但是要注意这个结果的位姿并不可靠
+        if (lmRan)
+        {
+            setTransformFromAffine(lmAffine);
+            transformUpdate();
+            currentOdomCov = lmMotionOk ? 1 : 2;
+            isDegenerate = true;
+            RCLCPP_WARN(this->get_logger(),
+                "[FALLBACK][PUBLISH_LM] ICP failed. lmMotionOK=%d cov=%d save=no",
+                (int)lmMotionOk, currentOdomCov);
+        }
+        else
+        {
+            setTransformFromAffine(priorAffine);
+            transformUpdate();
+            currentOdomCov = 2;
+            isDegenerate = true;
+            RCLCPP_WARN(this->get_logger(),
+                "[FALLBACK][PUBLISH_PRIOR] LM unavailable and ICP failed. cov=2 save=no");
         }
     }
 
@@ -1356,6 +2001,10 @@ public:
 
     bool saveFrame()
     {
+        // Only trajectory-curvature-continuous high-confidence poses enter the keyframe map.
+        // cov=1/2 are still published to IMUPreintegration with larger noise but never update the submap.
+        if (currentOdomCov != 0)
+            return false;
         if (cloudKeyPoses3D->points.empty())
             return true;
 
@@ -1574,9 +2223,19 @@ public:
         pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
 
+        // Save the full-resolution raw deskewed keyframe for future ICP fallback.
+        // Do NOT voxel-filter here. The feature keyframes are already based on
+        // laserCloudCornerLastDS / laserCloudSurfLastDS; for raw ICP fallback we
+        // keep the original deskewed scan and downsample only when constructing
+        // ICP source/target clouds.
+        pcl::PointCloud<PointType>::Ptr thisRawKeyFrame(new pcl::PointCloud<PointType>());
+        pcl::fromROSMsg(cloudInfo.cloud_deskewed, *thisRawKeyFrame);
+        filterInvalidAndRangeInPlace(thisRawKeyFrame, "raw_keyframe_save", true);
+
         // save key frame cloud
         cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+        rawCloudKeyFrames.push_back(thisRawKeyFrame);
 
         // save path for visualization
         updatePath(thisPose6D);
@@ -1648,7 +2307,21 @@ public:
         geometry_msgs::msg::Quaternion quat_msg;
         tf2::convert(quat_tf, quat_msg);
         laserOdometryROS.pose.pose.orientation = quat_msg;
+ 
+        // pose.covariance[0] semantic:
+        //   0 = high-confidence LiDAR correction
+        //   1 = weak LiDAR correction; IMUPreintegration should use larger noise
+        //   2 = very weak LiDAR correction; still published, but must not enter keyframe map
+        laserOdometryROS.pose.covariance[0] = currentOdomCov;
+        RCLCPP_WARN(this->get_logger(),
+            "[MAP_ODOM][PUBLISH] cov=%d xyz/rpy=(%.3f %.3f %.3f | %.2f %.2f %.2f deg)",
+            currentOdomCov,
+            transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5],
+            pcl::rad2deg(transformTobeMapped[0]), pcl::rad2deg(transformTobeMapped[1]), pcl::rad2deg(transformTobeMapped[2]));
         pubLaserOdometryGlobal->publish(laserOdometryROS);
+        if (offline_odometry_callback_)
+            offline_odometry_callback_(laserOdometryROS);
+        updateOutputTrajectoryHistory(trans2Affine3f(transformTobeMapped));
 
         // Publish TF
         quat_tf.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
@@ -1707,12 +2380,11 @@ public:
             geometry_msgs::msg::Quaternion quat_msg;
             tf2::convert(quat_tf, quat_msg);
             laserOdomIncremental.pose.pose.orientation = quat_msg;
-            if (isDegenerate)
-                laserOdomIncremental.pose.covariance[0] = 1;
-            else
-                laserOdomIncremental.pose.covariance[0] = 0;
+            laserOdomIncremental.pose.covariance[0] = currentOdomCov;
         }
         pubLaserOdometryIncremental->publish(laserOdomIncremental);
+        if (offline_incremental_odometry_callback_)
+            offline_incremental_odometry_callback_(laserOdomIncremental);
     }
 
     void publishFrames()
@@ -1752,6 +2424,7 @@ public:
 };
 
 
+#ifndef LIO_SAM_OFFLINE_LIBRARY
 int main(int argc, char** argv)
 {   
     rclcpp::init(argc, argv);
@@ -1777,3 +2450,4 @@ int main(int argc, char** argv)
 
     return 0;
 }
+#endif  // LIO_SAM_OFFLINE_LIBRARY
